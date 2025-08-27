@@ -52,33 +52,52 @@ serve(async (req) => {
     // Extract content based on file type
     if (filePath.toLowerCase().endsWith('.pdf')) {
       try {
-        // For PDF files, we'll use a simple text extraction
-        // Note: This is a basic implementation - for production use a proper PDF parser
+        // For PDF files - basic text extraction with proper cleaning
         const arrayBuffer = await fileData.arrayBuffer();
         const uint8Array = new Uint8Array(arrayBuffer);
-        const text = new TextDecoder().decode(uint8Array);
         
-        // Basic PDF text extraction (this is very rudimentary)
-        // In a real implementation, you'd use a proper PDF parsing library
-        const textMatches = text.match(/\(([^)]+)\)/g) || [];
+        // Convert to string and clean up
+        let rawText = '';
+        for (let i = 0; i < uint8Array.length; i++) {
+          const byte = uint8Array[i];
+          // Only include printable ASCII characters and common whitespace
+          if ((byte >= 32 && byte <= 126) || byte === 10 || byte === 13 || byte === 9) {
+            rawText += String.fromCharCode(byte);
+          }
+        }
+        
+        // Extract readable text patterns
+        const textMatches = rawText.match(/[A-Za-z][A-Za-z0-9\s.,!?;:'"()[\]{}\-_@#$%^&*+=<>\/\\]{10,}/g) || [];
         extractedContent = textMatches
-          .map(match => match.slice(1, -1))
-          .filter(text => text.length > 2 && /[a-zA-Z]/.test(text))
-          .join(' ');
+          .join(' ')
+          .replace(/\s+/g, ' ')
+          .trim()
+          .substring(0, 50000); // Limit to 50k characters
         
         if (!extractedContent.trim()) {
-          extractedContent = 'PDF content extraction not available - file appears to be image-based or encrypted';
+          extractedContent = 'This PDF appears to be image-based or contains content that cannot be extracted as text. Consider using OCR tools for better content extraction.';
         }
       } catch (error) {
         console.error('PDF extraction error:', error);
-        extractedContent = 'Failed to extract PDF content';
+        extractedContent = 'Failed to extract PDF content - the file may be corrupted or encrypted.';
       }
     } else if (filePath.toLowerCase().endsWith('.txt')) {
-      // For text files
-      extractedContent = await fileData.text();
+      // For text files - clean and limit content
+      const rawText = await fileData.text();
+      extractedContent = rawText
+        .replace(/\0/g, '') // Remove null bytes
+        .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, '') // Remove control characters
+        .trim()
+        .substring(0, 50000); // Limit to 50k characters
     } else {
-      extractedContent = 'Content extraction not supported for this file type';
+      extractedContent = 'Content extraction not supported for this file type. Supported types: PDF, TXT';
     }
+
+    // Final cleanup to ensure database compatibility
+    extractedContent = extractedContent
+      .replace(/\0/g, '') // Remove any remaining null bytes
+      .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, '') // Remove control characters
+      .trim();
 
     // Update document with extracted content
     const { error: updateError } = await supabase
