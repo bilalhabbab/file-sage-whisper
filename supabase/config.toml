@@ -47,3 +47,6 @@ port = 54327
 
 [functions.ai-chat]
 verify_jwt = true
+
+[functions.extract-content]
+verify_jwt = true

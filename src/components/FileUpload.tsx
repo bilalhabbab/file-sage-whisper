@@ -71,7 +71,7 @@ const FileUpload: React.FC<FileUploadProps> = ({ onUploadComplete }) => {
       );
 
       // Store file metadata in database
-      const { error: dbError } = await supabase
+      const { data: document, error: dbError } = await supabase
         .from('documents')
         .insert({
           user_id: user!.id,
@@ -79,10 +79,25 @@ const FileUpload: React.FC<FileUploadProps> = ({ onUploadComplete }) => {
           file_path: uploadData.path,
           file_size: file.size,
           file_type: file.type,
-        });
+        })
+        .select()
+        .single();
 
       if (dbError) {
         throw dbError;
+      }
+
+      // Extract content after upload (don't wait for completion)
+      try {
+        supabase.functions.invoke('extract-content', {
+          body: {
+            documentId: document.id,
+            filePath: uploadData.path
+          }
+        });
+      } catch (extractError) {
+        console.error('Content extraction failed:', extractError);
+        // Don't fail the upload if extraction fails
       }
 
       // Update status to complete
