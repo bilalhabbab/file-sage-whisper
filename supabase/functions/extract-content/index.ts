@@ -1,7 +1,6 @@
 import "https://deno.land/x/xhr@0.1.0/mod.ts";
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.56.0";
-import { getDocument } from "https://esm.sh/pdfjs-dist@4.0.379/legacy/build/pdf.mjs";
 
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
@@ -53,41 +52,27 @@ serve(async (req) => {
     // Extract content based on file type
     if (filePath.toLowerCase().endsWith('.pdf')) {
       try {
-        console.log('Starting PDF text extraction...');
+        // For PDF files - basic text extraction with proper cleaning
         const arrayBuffer = await fileData.arrayBuffer();
         const uint8Array = new Uint8Array(arrayBuffer);
         
-        // Use pdf.js for proper PDF parsing (similar to PyPDF2)
-        const pdf = await getDocument({ data: uint8Array }).promise;
-        console.log(`PDF loaded: ${pdf.numPages} pages`);
-        
-        let fullText = '';
-        
-        // Extract text from each page (similar to PyPDF2's page iteration)
-        for (let pageNum = 1; pageNum <= pdf.numPages; pageNum++) {
-          try {
-            const page = await pdf.getPage(pageNum);
-            const textContent = await page.getTextContent();
-            
-            const pageText = textContent.items
-              .map((item: any) => item.str)
-              .join(' ');
-            
-            fullText += pageText + '\n';
-            console.log(`Extracted page ${pageNum}: ${pageText.length} characters`);
-          } catch (pageError) {
-            console.error(`Error extracting page ${pageNum}:`, pageError);
-            fullText += `[Page ${pageNum}: extraction failed]\n`;
+        // Convert to string and clean up
+        let rawText = '';
+        for (let i = 0; i < uint8Array.length; i++) {
+          const byte = uint8Array[i];
+          // Only include printable ASCII characters and common whitespace
+          if ((byte >= 32 && byte <= 126) || byte === 10 || byte === 13 || byte === 9) {
+            rawText += String.fromCharCode(byte);
           }
         }
         
-        // Clean and limit the extracted text
-        extractedContent = fullText
-          .replace(/\s+/g, ' ') // Normalize whitespace
+        // Extract readable text patterns
+        const textMatches = rawText.match(/[A-Za-z][A-Za-z0-9\s.,!?;:'"()[\]{}\-_@#$%^&*+=<>\/\\]{10,}/g) || [];
+        extractedContent = textMatches
+          .join(' ')
+          .replace(/\s+/g, ' ')
           .trim()
           .substring(0, 50000); // Limit to 50k characters
-        
-        console.log(`Total extracted content length: ${extractedContent.length} characters`);
         
         if (!extractedContent.trim()) {
           extractedContent = 'This PDF appears to be image-based or contains content that cannot be extracted as text. Consider using OCR tools for better content extraction.';

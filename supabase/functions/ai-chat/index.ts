@@ -76,31 +76,15 @@ serve(async (req) => {
 
     // Prepare context from documents if available
     let documentContext = '';
-    let hasDocumentContent = false;
-    
     if (documents && documents.length > 0) {
-      const documentsWithContent = documents.filter((doc: any) => doc.content && doc.content.trim());
-      
-      if (documentsWithContent.length > 0) {
-        hasDocumentContent = true;
-        documentContext = `\n\nHere are the uploaded documents:\n${documentsWithContent.map((doc: any) => 
-          `Document: ${doc.name}\nContent: ${doc.content}`
-        ).join('\n\n')}`;
-      } else {
-        documentContext = `\n\nDocuments uploaded: ${documents.map((doc: any) => doc.name).join(', ')}, but content extraction is still in progress or failed.`;
-      }
+      documentContext = `\n\nDocument context:\n${documents.map((doc: any) => 
+        `Document: ${doc.name}\nContent: ${doc.content || 'File uploaded but content not extracted yet'}`
+      ).join('\n\n')}`;
     }
 
-    // Enhanced system prompt that mirrors the Python approach
-    const systemPrompt = `You are a helpful AI assistant for WSA Document Management. You analyze documents and provide insights, summaries, and answer questions about their content.
+    const systemPrompt = `You are a helpful AI assistant for WSA Document Management. You help users with questions about their uploaded documents and provide general assistance. 
 
-When users ask about their documents, provide detailed analysis including:
-- Key information and main points
-- Summaries when requested
-- Specific answers to user questions
-- Professional insights about the document content
-
-If no document content is available, let users know they need to upload documents first.${documentContext}`;
+If users ask about their documents, provide helpful insights and analysis. If no document context is provided, let them know you can help better once they upload relevant documents.${documentContext}`;
 
     // Call OpenAI API
     const response = await fetch('https://api.openai.com/v1/chat/completions', {
@@ -110,15 +94,13 @@ If no document content is available, let users know they need to upload document
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({
-        model: 'gpt-4.1-2025-04-14',
+        model: 'gpt-4o-mini',
         messages: [
           { role: 'system', content: systemPrompt },
-          { role: 'user', content: hasDocumentContent ? 
-            `Here is my question about the documents: ${message}` : 
-            message 
-          }
+          { role: 'user', content: message }
         ],
-        max_completion_tokens: 2000,
+        max_tokens: 1000,
+        temperature: 0.7,
       }),
     });
 
