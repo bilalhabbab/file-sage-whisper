@@ -48,9 +48,12 @@ const Auth = () => {
         } else {
           toast({
             title: "Success!",
-            description: "Account created successfully. Please check your email to verify your account."
+            description: "Account created successfully. You can now sign in."
           });
           setIsSignUp(false);
+          setEmail('');
+          setPassword('');
+          setFullName('');
         }
       } else {
         const { error } = await signIn(email, password);
