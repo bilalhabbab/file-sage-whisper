@@ -1,7 +1,6 @@
 import "https://deno.land/x/xhr@0.1.0/mod.ts";
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.56.0";
-import * as pdfParse from "https://esm.sh/pdf-parse@1.1.1";
 
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
@@ -53,19 +52,31 @@ serve(async (req) => {
     // Extract content based on file type
     if (filePath.toLowerCase().endsWith('.pdf')) {
       try {
-        console.log('Starting PDF text extraction with pdf-parse...');
+        console.log('Starting PDF text extraction...');
         
-        // Use pdf-parse library similar to PyPDF2
+        // Convert PDF to text using a more robust method for Deno
         const arrayBuffer = await fileData.arrayBuffer();
-        const buffer = new Uint8Array(arrayBuffer);
+        const uint8Array = new Uint8Array(arrayBuffer);
         
-        const pdfData = await pdfParse(buffer);
-        extractedContent = pdfData.text
-          .replace(/\0/g, '') // Remove null bytes
-          .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, '') // Remove control characters
-          .replace(/\s+/g, ' ') // Normalize whitespace
-          .trim()
-          .substring(0, 50000); // Limit to 50k characters
+        // Convert to string and extract readable text
+        let rawText = '';
+        for (let i = 0; i < uint8Array.length; i++) {
+          const byte = uint8Array[i];
+          // Include printable ASCII characters and common whitespace
+          if ((byte >= 32 && byte <= 126) || byte === 10 || byte === 13 || byte === 9) {
+            rawText += String.fromCharCode(byte);
+          }
+        }
+        
+        // Extract meaningful text patterns (words, sentences)
+        const textPatterns = rawText.match(/[A-Za-z][A-Za-z0-9\s.,!?;:'"()[\]{}\-_@#$%^&*+=<>\/\\]{5,}/g) || [];
+        const cleanedText = textPatterns
+          .join(' ')
+          .replace(/\s+/g, ' ')
+          .replace(/[^\x20-\x7E\n\r\t]/g, '') // Remove non-printable characters
+          .trim();
+        
+        extractedContent = cleanedText.substring(0, 50000); // Limit to 50k characters
         
         if (!extractedContent.trim()) {
           extractedContent = 'This PDF appears to be image-based or contains content that cannot be extracted as text. Consider using OCR tools for better content extraction.';
