@@ -1,6 +1,7 @@
 import "https://deno.land/x/xhr@0.1.0/mod.ts";
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.56.0";
+import * as pdfParse from "https://esm.sh/pdf-parse@1.1.1";
 
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
@@ -52,31 +53,25 @@ serve(async (req) => {
     // Extract content based on file type
     if (filePath.toLowerCase().endsWith('.pdf')) {
       try {
-        // For PDF files - basic text extraction with proper cleaning
+        console.log('Starting PDF text extraction with pdf-parse...');
+        
+        // Use pdf-parse library similar to PyPDF2
         const arrayBuffer = await fileData.arrayBuffer();
-        const uint8Array = new Uint8Array(arrayBuffer);
+        const buffer = new Uint8Array(arrayBuffer);
         
-        // Convert to string and clean up
-        let rawText = '';
-        for (let i = 0; i < uint8Array.length; i++) {
-          const byte = uint8Array[i];
-          // Only include printable ASCII characters and common whitespace
-          if ((byte >= 32 && byte <= 126) || byte === 10 || byte === 13 || byte === 9) {
-            rawText += String.fromCharCode(byte);
-          }
-        }
-        
-        // Extract readable text patterns
-        const textMatches = rawText.match(/[A-Za-z][A-Za-z0-9\s.,!?;:'"()[\]{}\-_@#$%^&*+=<>\/\\]{10,}/g) || [];
-        extractedContent = textMatches
-          .join(' ')
-          .replace(/\s+/g, ' ')
+        const pdfData = await pdfParse(buffer);
+        extractedContent = pdfData.text
+          .replace(/\0/g, '') // Remove null bytes
+          .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, '') // Remove control characters
+          .replace(/\s+/g, ' ') // Normalize whitespace
           .trim()
           .substring(0, 50000); // Limit to 50k characters
         
         if (!extractedContent.trim()) {
           extractedContent = 'This PDF appears to be image-based or contains content that cannot be extracted as text. Consider using OCR tools for better content extraction.';
         }
+        
+        console.log(`PDF extraction successful, extracted ${extractedContent.length} characters`);
       } catch (error) {
         console.error('PDF extraction error:', error);
         extractedContent = 'Failed to extract PDF content - the file may be corrupted or encrypted.';

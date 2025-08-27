@@ -77,9 +77,14 @@ serve(async (req) => {
     // Prepare context from documents if available
     let documentContext = '';
     if (documents && documents.length > 0) {
-      documentContext = `\n\nDocument context:\n${documents.map((doc: any) => 
-        `Document: ${doc.name}\nContent: ${doc.content || 'File uploaded but content not extracted yet'}`
-      ).join('\n\n')}`;
+      const documentsWithContent = documents.filter(doc => doc.content && doc.content.trim() !== '');
+      if (documentsWithContent.length > 0) {
+        documentContext = `\n\nHere are the uploaded documents and their content:\n\n${documentsWithContent.map((doc: any) => 
+          `Document: ${doc.name}\n\nContent:\n${doc.content}`
+        ).join('\n\n---\n\n')}`;
+      } else {
+        documentContext = `\n\nDocuments uploaded: ${documents.map(d => d.name).join(', ')}\nNote: Content extraction may still be in progress for these documents.`;
+      }
     }
 
     const systemPrompt = `You are a helpful AI assistant for WSA Document Management. You help users with questions about their uploaded documents and provide general assistance. 
