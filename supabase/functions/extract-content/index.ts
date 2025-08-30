@@ -2,7 +2,9 @@
 import "https://deno.land/x/xhr@0.1.0/mod.ts";
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.56.0";
-import * as pdfjsLib from "https://esm.sh/pdfjs-dist@4.7.76/legacy/build/pdf.mjs";
+
+// ⚠️ Replace pdfjs-dist with unpdf (serverless-friendly PDF.js)
+import { extractText, getDocumentProxy } from "https://esm.sh/unpdf@1.2.2";
 
 const CORS = {
   "Access-Control-Allow-Origin": "*",
@@ -11,9 +13,7 @@ const CORS = {
 };
 
 const MAX_OUTPUT_CHARS = 50_000;
-const MAX_PDF_PAGES = 1_000;          // hard ceiling for safety
-const SOFT_PDF_PAGES_LIMIT = 400;     // stop early for massive PDFs
-const OP_TIMEOUT_MS = 60_000;         // guard long parses (1 min)
+const OP_TIMEOUT_MS = 60_000;
 
 function json(body: unknown, init: ResponseInit = {}) {
   return new Response(JSON.stringify(body), {
@@ -25,14 +25,14 @@ function json(body: unknown, init: ResponseInit = {}) {
 function clean(s: string) {
   return s
     .replace(/\0/g, "")
-    .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, "") // control chars
-    .replace(/[ \t]+\n/g, "\n") // trim trailing spaces before newlines
-    .replace(/\n{3,}/g, "\n\n") // collapse >2 newlines
-    .replace(/[ \t]{2,}/g, " ") // collapse long runs of spaces
+    .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, "")
+    .replace(/[ \t]+\n/g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .replace(/[ \t]{2,}/g, " ")
     .trim();
 }
 
-/** Save extraction result with status. */
+/** Save extraction result with status + optional reason. */
 async function saveExtraction(
   supabase: ReturnType<typeof createClient>,
   userId: string,
@@ -41,9 +41,7 @@ async function saveExtraction(
   status: "complete" | "failed",
   failure_reason?: string,
 ) {
-  const payload: Record<string, unknown> = {
-    extraction_status: status,
-  };
+  const payload: Record<string, unknown> = { extraction_status: status };
   if (status === "complete") payload.content = content;
   if (failure_reason) payload.failure_reason = failure_reason.slice(0, 500);
 
@@ -84,7 +82,11 @@ serve(async (req) => {
 
   // --- BODY ---
   let body: any;
-  try { body = await req.json(); } catch { return json({ error: "Invalid JSON body" }, { status: 400 }); }
+  try {
+    body = await req.json();
+  } catch {
+    return json({ error: "Invalid JSON body" }, { status: 400 });
+  }
   const documentId = body?.documentId;
   const filePathRaw = body?.filePath;
   if (typeof documentId !== "string" || !documentId) {
@@ -100,14 +102,18 @@ serve(async (req) => {
   const { data: fileData, error: dlErr } = await supabase.storage.from("documents").download(filePath);
   if (dlErr) {
     console.error("Download error:", dlErr);
-    // Mark failed
     await saveExtraction(supabase, user.id, documentId, "", "failed", "Failed to download file");
     return json({ error: "Failed to download file" }, { status: 502 });
   }
 
   // --- TIMEOUT GUARD ---
-  const controller = new AbortController();
-  const t = setTimeout(() => controller.abort("Operation timed out"), OP_TIMEOUT_MS);
+  let timeoutId: number | undefined;
+  const timed = <T>(p: Promise<T>) =>
+    new Promise<T>((resolve, reject) => {
+      timeoutId = setTimeout(() => reject(new Error("Operation timed out")), OP_TIMEOUT_MS) as unknown as number;
+      p.then((v) => { clearTimeout(timeoutId); resolve(v); })
+       .catch((e) => { clearTimeout(timeoutId); reject(e); });
+    });
 
   // --- EXTRACT ---
   let content = "";
@@ -115,71 +121,23 @@ serve(async (req) => {
 
   try {
     if (lower.endsWith(".pdf")) {
-      // @ts-ignore Edge-safe: no worker
-      pdfjsLib.GlobalWorkerOptions.workerSrc = undefined;
       const buf = new Uint8Array(await fileData.arrayBuffer());
-      let doc;
-      try {
-        doc = await pdfjsLib.getDocument({ data: buf }).promise;
-      } catch (e: any) {
-        const msg = String(e?.message ?? e);
-        if (/password|encrypted/i.test(msg)) {
-          failure_reason = "Encrypted or password-protected PDF not supported.";
-        } else {
-          failure_reason = "Unable to open PDF (possibly corrupted).";
-        }
-        throw new Error(failure_reason);
-      }
 
-      if (doc.numPages > MAX_PDF_PAGES) {
-        failure_reason = `PDF has ${doc.numPages} pages (limit ${MAX_PDF_PAGES}).`;
-        throw new Error(failure_reason);
-      }
+      // Use unpdf's serverless PDF.js pipeline
+      const pdf = await timed(getDocumentProxy(buf));
 
-      const pages: string[] = [];
-      const cap = Math.min(doc.numPages, SOFT_PDF_PAGES_LIMIT);
-      for (let i = 1; i <= cap; i++) {
-        const page = await doc.getPage(i);
-        const tc = await page.getTextContent();
-        // Keep simple line breaks when font size drops or x goes backward
-        // (pdf.js positions items; here we do a light heuristic)
-        let line = "";
-        let lastX = 0;
-        let lastY = 0;
-        for (const it of tc.items as any[]) {
-          const s = typeof it?.str === "string" ? it.str : "";
-          if (!s) continue;
-          const trm = it?.transform as number[] | undefined;
-          const x = trm ? trm[4] : lastX;
-          const y = trm ? trm[5] : lastY;
-          const newLine = y !== lastY && Math.abs(y - lastY) > 2;
-          const backtrack = x < lastX - 2;
-          if (newLine || backtrack) {
-            line = line.trimEnd();
-            if (line) pages.push(line);
-            line = s;
-          } else {
-            line += (line ? " " : "") + s;
-          }
-          lastX = x;
-          lastY = y;
-        }
-        if (line) pages.push(line.trimEnd());
-        pages.push(""); // page break
-      }
-      if (cap < doc.numPages) {
-        pages.push(`[Truncated at ${cap}/${doc.numPages} pages for size/performance.]`);
-      }
-      content = clean(pages.join("\n")).slice(0, MAX_OUTPUT_CHARS);
+      // Returns a single combined text + totalPages
+      const { text, totalPages } = await timed(extractText(pdf, { mergePages: true }));
+
+      content = clean(text).slice(0, MAX_OUTPUT_CHARS);
       if (!content) {
-        content = "This PDF appears to be image-based or contains non-extractable text. Consider OCR.";
+        content = `This PDF appears to be image-based (no embedded text). Consider OCR and re-upload. Pages: ${totalPages}`;
       }
     } else if (lower.endsWith(".txt") || lower.endsWith(".md")) {
       const raw = await fileData.text();
       content = clean(raw).slice(0, MAX_OUTPUT_CHARS);
     } else if (lower.endsWith(".csv")) {
       const raw = await fileData.text();
-      // Keep CSV rows line-broken, but clean noisy whitespace
       const lines = raw.split(/\r?\n/).map((l) => l.replace(/[ \t]+/g, " ").trimEnd());
       content = clean(lines.join("\n")).slice(0, MAX_OUTPUT_CHARS);
     } else if (lower.endsWith(".json")) {
@@ -193,14 +151,13 @@ serve(async (req) => {
       content = "Content extraction not supported for this file type. Supported: PDF, TXT, MD, CSV, JSON";
     }
   } catch (e: any) {
-    clearTimeout(t);
     const reason = failure_reason || String(e?.message ?? e);
     console.error("Extraction error:", reason);
     const { error: upErr } = await saveExtraction(supabase, user.id, documentId, "", "failed", reason);
     if (upErr) console.error("Status update error (failed):", upErr);
     return json({ error: reason }, { status: 422 });
   } finally {
-    clearTimeout(t);
+    if (timeoutId !== undefined) clearTimeout(timeoutId);
   }
 
   // --- SAVE ---
