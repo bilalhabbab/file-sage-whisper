@@ -4,126 +4,214 @@ import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.56.0";
 import * as pdfjsLib from "https://esm.sh/pdfjs-dist@4.7.76/legacy/build/pdf.mjs";
 
-const cors = {
+const CORS = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
   "Access-Control-Allow-Methods": "POST, OPTIONS",
 };
 
+const MAX_OUTPUT_CHARS = 50_000;
+const MAX_PDF_PAGES = 1_000;          // hard ceiling for safety
+const SOFT_PDF_PAGES_LIMIT = 400;     // stop early for massive PDFs
+const OP_TIMEOUT_MS = 60_000;         // guard long parses (1 min)
+
+function json(body: unknown, init: ResponseInit = {}) {
+  return new Response(JSON.stringify(body), {
+    headers: { "Content-Type": "application/json", ...CORS },
+    ...init,
+  });
+}
+
 function clean(s: string) {
-  return s.replace(/\0/g, "")
-    .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, "")
-    .replace(/\s+/g, " ")
+  return s
+    .replace(/\0/g, "")
+    .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, "") // control chars
+    .replace(/[ \t]+\n/g, "\n") // trim trailing spaces before newlines
+    .replace(/\n{3,}/g, "\n\n") // collapse >2 newlines
+    .replace(/[ \t]{2,}/g, " ") // collapse long runs of spaces
     .trim();
 }
 
+/** Save extraction result with status. */
+async function saveExtraction(
+  supabase: ReturnType<typeof createClient>,
+  userId: string,
+  documentId: string,
+  content: string,
+  status: "complete" | "failed",
+  failure_reason?: string,
+) {
+  const payload: Record<string, unknown> = {
+    extraction_status: status,
+  };
+  if (status === "complete") payload.content = content;
+  if (failure_reason) payload.failure_reason = failure_reason.slice(0, 500);
+
+  return await supabase
+    .from("documents")
+    .update(payload)
+    .eq("id", documentId)
+    .eq("user_id", userId)
+    .select("id")
+    .single();
+}
+
 serve(async (req) => {
-  if (req.method === "OPTIONS") return new Response(null, { headers: cors });
+  if (req.method === "OPTIONS") return new Response(null, { headers: CORS });
+  if (req.method !== "POST") return json({ error: "Use POST." }, { status: 405 });
+
+  // --- ENV ---
+  const supabaseUrl = Deno.env.get("SUPABASE_URL");
+  const serviceKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
+  if (!supabaseUrl || !serviceKey) {
+    return json({ error: "Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY" }, { status: 500 });
+  }
+  const supabase = createClient(supabaseUrl, serviceKey, {
+    auth: { autoRefreshToken: false, persistSession: false },
+  });
+
+  // --- AUTH ---
+  const auth = req.headers.get("Authorization");
+  if (!auth?.startsWith("Bearer ")) {
+    return json({ error: "No authorization header" }, { status: 401 });
+  }
+  const token = auth.slice("Bearer ".length).trim();
+  const { data: userRes, error: authErr } = await supabase.auth.getUser(token);
+  if (authErr || !userRes?.user) {
+    return json({ error: "Unauthorized" }, { status: 401 });
+  }
+  const user = userRes.user;
+
+  // --- BODY ---
+  let body: any;
+  try { body = await req.json(); } catch { return json({ error: "Invalid JSON body" }, { status: 400 }); }
+  const documentId = body?.documentId;
+  const filePathRaw = body?.filePath;
+  if (typeof documentId !== "string" || !documentId) {
+    return json({ error: "Missing 'documentId' (string)" }, { status: 400 });
+  }
+  if (typeof filePathRaw !== "string" || !filePathRaw) {
+    return json({ error: "Missing 'filePath' (string)" }, { status: 400 });
+  }
+  const filePath = filePathRaw.replace(/^\/+/, "");
+  const lower = filePath.toLowerCase();
+
+  // --- DOWNLOAD ---
+  const { data: fileData, error: dlErr } = await supabase.storage.from("documents").download(filePath);
+  if (dlErr) {
+    console.error("Download error:", dlErr);
+    // Mark failed
+    await saveExtraction(supabase, user.id, documentId, "", "failed", "Failed to download file");
+    return json({ error: "Failed to download file" }, { status: 502 });
+  }
+
+  // --- TIMEOUT GUARD ---
+  const controller = new AbortController();
+  const t = setTimeout(() => controller.abort("Operation timed out"), OP_TIMEOUT_MS);
+
+  // --- EXTRACT ---
+  let content = "";
+  let failure_reason: string | undefined;
 
   try {
-    const supabaseUrl = Deno.env.get("SUPABASE_URL");
-    const serviceKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
-    if (!supabaseUrl || !serviceKey) {
-      return new Response(JSON.stringify({ error: "Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY" }), {
-        status: 500, headers: { ...cors, "Content-Type": "application/json" },
-      });
-    }
-    const supabase = createClient(supabaseUrl, serviceKey);
-
-    // auth
-    const auth = req.headers.get("Authorization");
-    if (!auth?.startsWith("Bearer ")) {
-      return new Response(JSON.stringify({ error: "No authorization header" }), {
-        status: 401, headers: { ...cors, "Content-Type": "application/json" },
-      });
-    }
-    const token = auth.slice("Bearer ".length).trim();
-    const { data: userRes, error: authErr } = await supabase.auth.getUser(token);
-    if (authErr || !userRes?.user) {
-      return new Response(JSON.stringify({ error: "Unauthorized" }), {
-        status: 401, headers: { ...cors, "Content-Type": "application/json" },
-      });
-    }
-    const user = userRes.user;
-
-    // body
-    let body: any;
-    try { body = await req.json(); } catch { body = null; }
-    const documentId = body?.documentId;
-    const filePath = (body?.filePath || "").replace(/^\/+/, "");
-    if (!documentId || !filePath) {
-      return new Response(JSON.stringify({ error: "Missing documentId or filePath" }), {
-        status: 400, headers: { ...cors, "Content-Type": "application/json" },
-      });
-    }
-
-    // download
-    const { data: fileData, error: dlErr } = await supabase.storage.from("documents").download(filePath);
-    if (dlErr) {
-      console.error("Download error:", dlErr);
-      return new Response(JSON.stringify({ error: "Failed to download file" }), {
-        status: 500, headers: { ...cors, "Content-Type": "application/json" },
-      });
-    }
-
-    // extract
-    let content = "";
-    const lower = filePath.toLowerCase();
-
     if (lower.endsWith(".pdf")) {
+      // @ts-ignore Edge-safe: no worker
+      pdfjsLib.GlobalWorkerOptions.workerSrc = undefined;
+      const buf = new Uint8Array(await fileData.arrayBuffer());
+      let doc;
       try {
-        // Edge-safe: run pdf.js without a worker
-        // @ts-ignore
-        pdfjsLib.GlobalWorkerOptions.workerSrc = undefined;
-        const buf = new Uint8Array(await fileData.arrayBuffer());
-        const pdf = await pdfjsLib.getDocument({ data: buf }).promise;
-
-        const pages: string[] = [];
-        for (let i = 1; i <= pdf.numPages; i++) {
-          const page = await pdf.getPage(i);
-          const tc = await page.getTextContent();
-          const txt = tc.items.map((it: any) => (typeof it?.str === "string" ? it.str : "")).join(" ");
-          pages.push(txt);
+        doc = await pdfjsLib.getDocument({ data: buf }).promise;
+      } catch (e: any) {
+        const msg = String(e?.message ?? e);
+        if (/password|encrypted/i.test(msg)) {
+          failure_reason = "Encrypted or password-protected PDF not supported.";
+        } else {
+          failure_reason = "Unable to open PDF (possibly corrupted).";
         }
-        content = clean(pages.join("\n\n")).slice(0, 50_000);
-        if (!content) content = "This PDF appears to be image-based or contains non-extractable text. Consider OCR.";
-      } catch (e) {
-        console.error("PDF.js extraction error:", e);
-        content = "Failed to extract PDF content - the file may be corrupted or encrypted.";
+        throw new Error(failure_reason);
       }
-    } else if (lower.endsWith(".txt")) {
+
+      if (doc.numPages > MAX_PDF_PAGES) {
+        failure_reason = `PDF has ${doc.numPages} pages (limit ${MAX_PDF_PAGES}).`;
+        throw new Error(failure_reason);
+      }
+
+      const pages: string[] = [];
+      const cap = Math.min(doc.numPages, SOFT_PDF_PAGES_LIMIT);
+      for (let i = 1; i <= cap; i++) {
+        const page = await doc.getPage(i);
+        const tc = await page.getTextContent();
+        // Keep simple line breaks when font size drops or x goes backward
+        // (pdf.js positions items; here we do a light heuristic)
+        let line = "";
+        let lastX = 0;
+        let lastY = 0;
+        for (const it of tc.items as any[]) {
+          const s = typeof it?.str === "string" ? it.str : "";
+          if (!s) continue;
+          const trm = it?.transform as number[] | undefined;
+          const x = trm ? trm[4] : lastX;
+          const y = trm ? trm[5] : lastY;
+          const newLine = y !== lastY && Math.abs(y - lastY) > 2;
+          const backtrack = x < lastX - 2;
+          if (newLine || backtrack) {
+            line = line.trimEnd();
+            if (line) pages.push(line);
+            line = s;
+          } else {
+            line += (line ? " " : "") + s;
+          }
+          lastX = x;
+          lastY = y;
+        }
+        if (line) pages.push(line.trimEnd());
+        pages.push(""); // page break
+      }
+      if (cap < doc.numPages) {
+        pages.push(`[Truncated at ${cap}/${doc.numPages} pages for size/performance.]`);
+      }
+      content = clean(pages.join("\n")).slice(0, MAX_OUTPUT_CHARS);
+      if (!content) {
+        content = "This PDF appears to be image-based or contains non-extractable text. Consider OCR.";
+      }
+    } else if (lower.endsWith(".txt") || lower.endsWith(".md")) {
       const raw = await fileData.text();
-      content = clean(raw).slice(0, 50_000);
+      content = clean(raw).slice(0, MAX_OUTPUT_CHARS);
+    } else if (lower.endsWith(".csv")) {
+      const raw = await fileData.text();
+      // Keep CSV rows line-broken, but clean noisy whitespace
+      const lines = raw.split(/\r?\n/).map((l) => l.replace(/[ \t]+/g, " ").trimEnd());
+      content = clean(lines.join("\n")).slice(0, MAX_OUTPUT_CHARS);
+    } else if (lower.endsWith(".json")) {
+      try {
+        const obj = JSON.parse(await fileData.text());
+        content = clean(JSON.stringify(obj, null, 2)).slice(0, MAX_OUTPUT_CHARS);
+      } catch {
+        content = clean(await fileData.text()).slice(0, MAX_OUTPUT_CHARS);
+      }
     } else {
-      content = "Content extraction not supported for this file type. Supported types: PDF, TXT";
+      content = "Content extraction not supported for this file type. Supported: PDF, TXT, MD, CSV, JSON";
     }
-
-    // save
-    const { error: upErr, data: upData } = await supabase
-      .from("documents")
-      .update({ content, extraction_status: "complete" })
-      .eq("id", documentId)
-      .eq("user_id", user.id)
-      .select("id");
-    if (upErr) {
-      console.error("Update error:", upErr);
-      return new Response(JSON.stringify({ error: "Failed to save extracted content" }), {
-        status: 500, headers: { ...cors, "Content-Type": "application/json" },
-      });
-    }
-    if (!upData?.length) {
-      return new Response(JSON.stringify({ error: "Document not found for this user" }), {
-        status: 404, headers: { ...cors, "Content-Type": "application/json" },
-      });
-    }
-
-    return new Response(JSON.stringify({ success: true, content }), {
-      headers: { ...cors, "Content-Type": "application/json" },
-    });
   } catch (e: any) {
-    console.error("Unhandled error:", e);
-    return new Response(JSON.stringify({ error: String(e?.message ?? e) }), {
-      status: 500, headers: { ...cors, "Content-Type": "application/json" },
-    });
+    clearTimeout(t);
+    const reason = failure_reason || String(e?.message ?? e);
+    console.error("Extraction error:", reason);
+    const { error: upErr } = await saveExtraction(supabase, user.id, documentId, "", "failed", reason);
+    if (upErr) console.error("Status update error (failed):", upErr);
+    return json({ error: reason }, { status: 422 });
+  } finally {
+    clearTimeout(t);
   }
+
+  // --- SAVE ---
+  const { error: upErr, data } = await saveExtraction(supabase, user.id, documentId, content, "complete");
+  if (upErr) {
+    console.error("Update error:", upErr);
+    return json({ error: "Failed to save extracted content" }, { status: 500 });
+  }
+  if (!data?.id) {
+    return json({ error: "Document not found for this user" }, { status: 404 });
+  }
+
+  return json({ success: true, content });
 });
